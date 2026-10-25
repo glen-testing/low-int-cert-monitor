@@ -1,0 +1,7 @@
+[Unit]
+Description=p4mon daily report (email + Claude push)
+[Service]
+Type=oneshot
+User=ec2-user
+WorkingDirectory=/home/ec2-user/p4-inventory/p4mon
+ExecStart=/home/ec2-user/p4-inventory/p4mon/deliver.py daily

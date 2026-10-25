@@ -1,0 +1,56 @@
+[Unit]
+Description=p4mon CT weak-key live monitor (fresh-start, lowest priority)
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ec2-user
+WorkingDirectory=/home/ec2-user/p4-inventory/p4mon
+Environment=DEDUP=1
+Environment=P4MON_FINDINGS=/home/ec2-user/p4-inventory/p4mon/findings.jsonl
+# fetch the CT log list (drives shard selection) if missing, before starting
+ExecStartPre=/bin/sh -c 'test -s loglist.json || curl -fsS --max-time 30 -o loglist.json https://www.gstatic.com/ct/log_list/v3/log_list.json'
+ExecStart=/bin/bash -c 'exec python3 ct_tail_live.py | DEDUP=1 P4MON_FINDINGS=/home/ec2-user/p4-inventory/p4mon/findings.jsonl ./target/release/p4mon stream table.bin'
+Restart=always
+RestartSec=10
+
+# ---- 1 CPU core max ----
+CPUAffinity=0
+CPUQuota=100%
+
+# ---- strictly lower precedence than sshd / tailscaled ----
+Nice=19
+CPUSchedulingPolicy=idle
+IOSchedulingClass=idle
+CPUWeight=1
+IOWeight=1
+OOMScoreAdjust=1000
+
+# ---- memory safety (no-swap box) ----
+MemoryHigh=768M
+MemoryMax=1024M
+TasksMax=64
+
+# ---- sandbox: parses untrusted CT data; deny it the box's secrets ----
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/home/ec2-user/p4-inventory/p4mon
+InaccessiblePaths=-/home/ec2-user/.ssh -/home/ec2-user/.aws -/home/ec2-user/.claude -/home/ec2-user/.config/openrouter -/home/ec2-user/.config/gh
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

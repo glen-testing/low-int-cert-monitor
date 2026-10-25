@@ -1,0 +1,12 @@
+# p4mon alert targets — one Apprise URL per line. Copy to ~/.config/p4mon/apprise.txt
+# (chmod 600; URLs contain credentials). Pick any delivery methodology:
+#
+# Email (Gmail app password):   mailto://USER:APP_PASSWORD@gmail.com
+# Email (generic SMTP):         mailtos://USER:PASS@smtp.example.com?to=you@example.com
+# ntfy:                         ntfy://ntfy.sh/your-topic
+# Pushover:                     pover://USER_KEY@APP_TOKEN
+# Telegram:                     tgram://BOT_TOKEN/CHAT_ID
+# Slack:                        slack://TOKEN_A/TOKEN_B/TOKEN_C
+# Webhook (JSON POST):          json://your.host/path
+#
+# Multiple lines = delivered to all of them. Full scheme list: https://github.com/caronc/apprise

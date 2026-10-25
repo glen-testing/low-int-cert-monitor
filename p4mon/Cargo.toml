@@ -1,0 +1,22 @@
+[package]
+name = "p4mon"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "p4mon"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[dependencies]
+p256 = { version = "0.13", features = ["arithmetic"] }
+p384 = { version = "0.13", features = ["arithmetic"] }
+p521 = { version = "0.13", features = ["arithmetic"] }
+ahash = "0.8"
+x509-parser = "0.16"
+sha2 = "0.10"

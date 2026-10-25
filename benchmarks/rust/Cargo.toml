@@ -1,0 +1,15 @@
+[package]
+name = "wkd"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+p256 = { version = "0.14.0", features = ["arithmetic"] }
+p384 = { version = "0.14.0", features = ["arithmetic"] }
+p521 = { version = "0.14.0", features = ["arithmetic"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"

@@ -1,0 +1,7 @@
+[Unit]
+Description=Daily p4mon report at 13:07 UTC
+[Timer]
+OnCalendar=*-*-* 13:07:00 UTC
+Persistent=true
+[Install]
+WantedBy=timers.target

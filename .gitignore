@@ -1,0 +1,12 @@
+target/
+build/
+*.o
+*.bin
+__pycache__/
+*.pyc
+loglist.json
+*.der
+*.log
+*.csv
+findings.jsonl
+.find_last

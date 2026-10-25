@@ -1,0 +1,7 @@
+[Unit]
+Description=Watch p4mon findings.jsonl for new weak keys
+[Path]
+PathModified=/home/ec2-user/p4-inventory/p4mon/findings.jsonl
+Unit=p4mon-find.service
+[Install]
+WantedBy=multi-user.target
