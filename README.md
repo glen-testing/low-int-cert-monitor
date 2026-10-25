@@ -10,6 +10,18 @@ Curves: P-256, P-384, P-521.
 - `benchmarks/` — `rust` `c` `cpp` `go` detector implementations
 - `reference/` — Python detector and CCADB / BSGS sweepers
 
+## Performance (single core, ~24h steady state)
+| metric | value |
+|---|---|
+| certificates scanned | ~220M sightings/day → ~11M distinct keys (90% cross-log dedup) |
+| weak keys found | 0 |
+| CPU | ~5% of one core (hard-capped at 1 core, SCHED_IDLE) |
+| RAM | ~580 MB (peak 642 MB, 1 GB cap) |
+| network | ~30–40 Mbit/s ingress (~300–430 GB/day); egress negligible |
+| disk I/O | ~none (table loads once from page cache; findings written only on a hit) |
+
+Scales with CT issuance volume. Measured on AWS m7g.large (aarch64), 16 logs.
+
 ## p4mon
     cargo build --release --manifest-path p4mon/Cargo.toml
     cd p4mon
