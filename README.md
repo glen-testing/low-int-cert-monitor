@@ -1,7 +1,7 @@
 # low-int-cert-monitor
 
 Detect X.509 certificates whose elliptic-curve private key is a trivially small
-integer (public point Q = d*G for small d) — the eMudhra misissuance class.
+integer (public point Q = d*G for small d) which is the same as eMudhra.
 Curves: P-256, P-384, P-521.
 
 ## Layout
@@ -15,12 +15,12 @@ Curves: P-256, P-384, P-521.
 |---|---|
 | certificates scanned | ~220M sightings/day → ~11M distinct keys (90% cross-log dedup) |
 | weak keys found | 0 |
-| CPU | ~5% of one core (hard-capped at 1 core, SCHED_IDLE) |
+| CPU | ~5% of one core (I capped mine @1core) |
 | RAM | ~580 MB (peak 642 MB, 1 GB cap) |
-| network | ~30–40 Mbit/s ingress (~300–430 GB/day); egress negligible |
-| disk I/O | ~none (table loads once from page cache; findings written only on a hit) |
+| network | ~30–40 Mbit/s ingress (~300–430 GB/day) |
+| disk I/O | ~none (table loads once from page cache; findings are written only for hits) |
 
-Scales with CT issuance volume. Measured on AWS m7g.large (aarch64), 16 logs.
+Scales with CT issuance volume. Measured on AWS m7g.large (aarch64), 16 CT logs ingested.
 
 ## p4mon
     cargo build --release --manifest-path p4mon/Cargo.toml
