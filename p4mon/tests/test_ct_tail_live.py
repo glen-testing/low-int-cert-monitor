@@ -1,10 +1,16 @@
+import base64
+import contextlib
 import datetime
 import gzip
 import hashlib
+import http.client
+import io
 import json
 import os
 import sys
 import tempfile
+import threading
+import urllib.error
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -42,6 +48,7 @@ class FakeConn:
     def __init__(self, files):
         self.files = files
         self.requested = []
+        self.closed = False
 
     def raw(self, suffix):
         self.requested.append(suffix)
@@ -49,8 +56,11 @@ class FakeConn:
             raise OSError("404 " + suffix)
         return self.files[suffix]
 
+    def get(self, suffix):
+        return json.loads(self.raw(suffix))
+
     def close(self):
-        pass
+        self.closed = True
 
 
 class Clock:
@@ -59,6 +69,11 @@ class Clock:
 
     def __call__(self):
         return self.now
+
+
+def read_json(path):
+    with open(path) as f:
+        return json.load(f)
 
 
 def tile(leaves):
@@ -202,7 +217,11 @@ def loglist(now):
             {"description": "A tiles", "monitoring_url": "https://a/mon/", "submission_url": "https://a/sub/",
              "state": {"qualified": {}}, "temporal_interval": iv(50, 200)},
         ]},
-        {"name": "B", "tiled_logs": [
+        {"name": "B", "logs": [
+            {"description": "B cf", "url": "https://ct.cloudflare.com/b/", "state": usable, "temporal_interval": iv(-10, 100)},
+            {"description": "B nourl", "state": usable, "temporal_interval": iv(-10, 100)},
+            {"description": "B nointerval", "url": "https://b/noiv/", "state": usable},
+        ], "tiled_logs": [
             {"description": "B tiles", "monitoring_url": "https://b/mon/", "state": usable,
              "temporal_interval": iv(-10, 100)},
         ]},
@@ -236,14 +255,150 @@ class Reconcile(unittest.TestCase):
         self.assertEqual(stop, {a.url})
 
 
-class StopEvent(unittest.TestCase):
-    def test_tail_returns_when_stopped(self):
-        import threading
-        stop = threading.Event(); stop.set()
-        src = t.StaticCT(FakeConn({"checkpoint": b"o\n5\nAAAA\n\n- sig\n"}), t.IssuerCache())
-        t.stats["stopped"] = {"ok": 0, "r429": 0, "err": 0, "certs": 0, "sth": 0, "bad": 0}
-        t.tail(t.Log("stopped", "static", "https://x/"), stop, src)
-        self.assertEqual(src.conn.requested, ["checkpoint"])
+def rfc_entry(leaf, chain, precert=False):
+    head = b"\x00\x00" + (1).to_bytes(8, "big") + (b"\x00\x01" if precert else b"\x00\x00")
+    li = head + (b"\x11" * 32 + u24(b"\x30\x01T") if precert else u24(leaf)) + u16(b"")
+    links = u24(b"".join(u24(c) for c in chain))
+    xd = (u24(leaf) + links) if precert else links
+    return {"leaf_input": base64.b64encode(li).decode(), "extra_data": base64.b64encode(xd).decode()}
+
+
+class Rfc6962Fetch(unittest.TestCase):
+    def test_leaf_precert_and_chains_are_emitted_and_junk_counted(self):
+        leaf, pre, i1, i2 = cert("leaf"), cert("pre"), cert("i1"), cert("i2")
+        entries = [rfc_entry(leaf, [i1, i2]), rfc_entry(pre, [i1], precert=True),
+                   rfc_entry(b"\x02notder", []), {"leaf_input": "!!", "extra_data": ""}]
+        conn = FakeConn({"ct/v1/get-entries?start=7&end=10": json.dumps({"entries": entries}).encode(),
+                         "ct/v1/get-sth": b'{"tree_size": 11}'})
+        src = t.Rfc6962(conn)
+        self.assertEqual(src.size(), 11)
+        self.assertEqual(src.fetch(7, 11), ([leaf, i1, i2, pre, i1], 4))
+        self.assertEqual(src.bad, 1)
+
+    def test_precert_without_chain(self):
+        pre = cert("pre")
+        e = rfc_entry(pre, [], precert=True)
+        e["extra_data"] = base64.b64encode(u24(pre)).decode()
+        self.assertEqual(t.ders_from(e), [pre])
+
+    def test_batch_is_capped(self):
+        conn = FakeConn({f"ct/v1/get-entries?start=0&end={t.BATCH - 1}": b'{"entries": []}'})
+        self.assertEqual(t.Rfc6962(conn).fetch(0, 10 ** 6), ([], 0))
+
+
+class Frame(unittest.TestCase):
+    def test_records_are_u32le_length_prefixed(self):
+        self.assertEqual(t.frame([b"ab", b"\x30"]), b"\x02\x00\x00\x00ab\x01\x00\x00\x000")
+
+
+class ScriptedSource:
+    def __init__(self, sizes, fetches):
+        self.sizes, self.fetches, self.calls = list(sizes), list(fetches), []
+        self.conn, self.bad = FakeConn({}), 0
+
+    @staticmethod
+    def _play(v):
+        if isinstance(v, Exception):
+            raise v
+        return v
+
+    def size(self):
+        return self._play(self.sizes.pop(0))
+
+    def fetch(self, cursor, head):
+        self.calls.append((cursor, head))
+        return self._play(self.fetches.pop(0))
+
+
+def throttled(retry):
+    hdrs = http.client.HTTPMessage()
+    hdrs["Retry-After"] = retry
+    return urllib.error.HTTPError("u", 429, "Too Many Requests", hdrs, None)
+
+
+class Tail(unittest.TestCase):
+    def run_tail(self, src, sleeps_before_stop):
+        stop, slept, out = threading.Event(), [], []
+
+        def sleep(s):
+            slept.append(s)
+            if len(slept) >= sleeps_before_stop:
+                stop.set()
+        name = self.id()
+        t.stats[name] = t.new_stats()
+        t.tail(t.Log(name, "static", "https://x/"), stop, src, sleep=sleep, sink=out.append)
+        return slept, b"".join(out), t.stats[name]
+
+    def test_starts_at_head_backs_off_and_streams_every_entry(self):
+        d1, d2 = cert("one"), cert("two")
+        src = ScriptedSource(sizes=[10, 12, 12, OSError("sth down")],
+                             fetches=[throttled("3"), OSError("reset"), ([d1], 1), ([], 0), ([d2], 1)])
+        slept, out, st = self.run_tail(src, 4)
+        self.assertEqual(slept, [3.0, 1.0, t.POLL, t.POLL])
+        self.assertEqual(out, t.frame([d1]) + t.frame([d2]))
+        self.assertEqual(src.calls, [(10, 12), (10, 12), (10, 12), (11, 12), (11, 12)])
+        self.assertEqual((st["r429"], st["err"], st["certs"], st["ok"], st["sth"]), (1, 1, 2, 2, 4))
+        self.assertTrue(src.conn.closed)
+
+    def test_server_error_backs_off_without_counting_a_429(self):
+        src = ScriptedSource(sizes=[0, 5], fetches=[urllib.error.HTTPError("u", 503, "x", http.client.HTTPMessage(), None)])
+        slept, _, st = self.run_tail(src, 1)
+        self.assertEqual((slept, st["r429"], st["err"]), ([0.5], 0, 1))
+
+    def test_initial_size_failure_gives_up(self):
+        src = ScriptedSource(sizes=[OSError("dns")], fetches=[])
+        slept, out, _ = self.run_tail(src, 1)
+        self.assertEqual((slept, out, src.calls), ([], b"", []))
+        self.assertTrue(src.conn.closed)
+
+
+class RefreshCycle(unittest.TestCase):
+    def test_new_list_starts_new_logs_and_stops_dropped_ones(self):
+        now = datetime.datetime.now(datetime.timezone.utc)
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "loglist.json")
+            old = threading.Event()
+            running = {"https://gone/": old}
+            launched = []
+            body = json.dumps(loglist(now)).encode()
+            t.refresh_cycle(running, path, lambda: body, now, lambda logs, r: launched.extend(logs))
+            self.assertTrue(old.is_set())
+            self.assertNotIn("https://gone/", running)
+            self.assertEqual([lg.name for lg in launched], ["A rfc", "A tiles", "B tiles"])
+            self.assertEqual(read_json(path), loglist(now))
+
+    def test_failed_fetch_changes_nothing(self):
+        now = datetime.datetime.now(datetime.timezone.utc)
+        with tempfile.TemporaryDirectory() as d:
+            ev = threading.Event()
+            running = {"https://a/rfc/": ev}
+            t.refresh_cycle(running, os.path.join(d, "x.json"), lambda: b"nope", now, lambda *a: self.fail("launched"))
+            self.assertEqual(running, {"https://a/rfc/": ev})
+            self.assertFalse(ev.is_set())
+
+
+class Boot(unittest.TestCase):
+    def test_missing_list_is_fetched_once(self):
+        now = datetime.datetime.now(datetime.timezone.utc)
+        calls = []
+
+        def fetch():
+            calls.append(1)
+            return json.dumps(loglist(now)).encode()
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "loglist.json")
+            self.assertTrue(t.boot(path, fetch, now))
+            t.boot(path, fetch, now)
+            self.assertEqual(len(calls), 1)
+
+    def test_banner_warns_without_contact(self):
+        logs = [t.Log("L", "static", "https://l/")]
+        for contact, warned in (("", True), ("ops@example.org", False)):
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                t.banner(logs, contact)
+            self.assertEqual("P4MON_CONTACT unset" in err.getvalue(), warned)
+            self.assertIn("https://l/", err.getvalue())
 
 
 class RefreshLoglist(unittest.TestCase):
@@ -251,11 +406,11 @@ class RefreshLoglist(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "loglist.json")
             self.assertTrue(t.refresh_loglist(path, lambda: b'{"operators": []}'))
-            self.assertEqual(json.load(open(path)), {"operators": []})
+            self.assertEqual(read_json(path), {"operators": []})
             self.assertFalse(t.refresh_loglist(path, lambda: b"<html>oops"))
-            self.assertEqual(json.load(open(path)), {"operators": []})
+            self.assertEqual(read_json(path), {"operators": []})
             self.assertFalse(t.refresh_loglist(path, lambda: b'{"no": "operators"}'))
-            self.assertEqual(json.load(open(path)), {"operators": []})
+            self.assertEqual(read_json(path), {"operators": []})
 
 
 class UserAgent(unittest.TestCase):

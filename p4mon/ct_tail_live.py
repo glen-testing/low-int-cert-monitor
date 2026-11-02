@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import json, threading, time, base64, struct, urllib.request, urllib.error, urllib.parse, http.client, sys, os, signal, datetime, gzip, hashlib, email.utils
+import json, threading, time, base64, struct, urllib.request, urllib.error, urllib.parse, http.client, sys, os, signal, datetime, gzip, hashlib, email.utils, itertools
 from typing import NamedTuple
 UA = "p4mon-ct-weakkey-monitor/0.1"
 BATCH = 256
@@ -171,13 +171,9 @@ class StaticCT:
         body = self.conn.raw(f"tile/data/{tile_path(n)}" + ("" if width == TILE else f".p/{width}"))
         out = []; fresh = {}
         try:
-            for i, (cert, fps) in enumerate(tile_leaves(body)):
-                if i >= width: break
-                if i < skip: continue
+            for cert, fps in itertools.islice(tile_leaves(body), skip, width):
                 if cert and cert[0] == 0x30: out.append(cert)
-                for fp in fps:
-                    if fp in fresh or self.issuers.seen(fp): continue
-                    fresh[fp] = self._issuer(fp); out.append(fresh[fp])
+                out += self._issuers_for(fps, fresh)
         except ValueError as ex:
             # Tiles are immutable and fully downloaded, so a parse error is
             # permanent: skip the rest of the tile rather than stall the log.
@@ -185,6 +181,12 @@ class StaticCT:
             sys.stderr.write(f"  [{self.name}] malformed data tile {n}: {ex}; skipped\n")
         for fp in fresh: self.issuers.add(fp)
         return out, width - skip
+    def _issuers_for(self, fps, fresh):
+        # Issuers not yet emitted by any log; recorded in `fresh` until the
+        # whole tile parsed, so a malformed tile cannot hide them for good.
+        new = [fp for fp in dict.fromkeys(fps) if fp not in fresh and not self.issuers.seen(fp)]
+        for fp in new: fresh[fp] = self._issuer(fp)
+        return [fresh[fp] for fp in new]
 
 def _iso(s): return datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
 
@@ -202,16 +204,20 @@ def pick_logs(data, now, max_logs=MAXLOGS, max_per_op=MAX_PER_OP):
     # certs (which expire up to ~13 months out) are all covered. Both RFC 6962
     # logs ("logs") and static-ct logs ("tiled_logs"); a cap of 0 = no cap.
     horizon = now + datetime.timedelta(days=WINDOW_DAYS)
-    out = []; per = {}
+    out = []
     for op in data.get("operators", []):
-        cands = [Log(lg.get("description", lg.get("url", "")), "rfc6962", lg.get("url", "")) for lg in op.get("logs", []) if _current(lg, now, horizon)]
-        cands += [Log(lg.get("description", lg.get("monitoring_url", "")), "static", lg.get("monitoring_url", "")) for lg in op.get("tiled_logs", []) if _current(lg, now, horizon)]
-        for lg in cands:
-            if not lg.url or "cloudflare" in lg.url: continue
-            if max_per_op and per.get(op["name"], 0) >= max_per_op: continue
-            out.append(lg); per[op["name"]] = per.get(op["name"], 0) + 1
-            if max_logs and len(out) >= max_logs: return out
-    return out
+        out += list(_candidates(op, now, horizon))[:max_per_op or None]
+    return out[:max_logs or None]
+
+# (log-list key, Log.kind, URL field) for each API the log list describes.
+KINDS = (("logs", "rfc6962", "url"), ("tiled_logs", "static", "monitoring_url"))
+
+def _candidates(op, now, horizon):
+    for key, kind, field in KINDS:
+        for lg in op.get(key, []):
+            url = lg.get(field, "")
+            if url and "cloudflare" not in url and _current(lg, now, horizon):
+                yield Log(lg.get("description", url), kind, url)
 
 ISSUERS = IssuerCache()
 
@@ -219,40 +225,54 @@ def source_for(log):
     conn = Conn(log.url)
     return Rfc6962(conn) if log.kind == "rfc6962" else StaticCT(conn, ISSUERS, log.name)
 
-def tail(log, stop, src=None):
+def new_stats(): return {"ok": 0, "r429": 0, "err": 0, "certs": 0, "sth": 0, "bad": 0}
+
+def frame(ders):
+    # p4mon stream input: [u32 LE length][DER] per certificate.
+    return b"".join(struct.pack("<I", len(d)) + d for d in ders)
+
+def write_out(blob):
+    with wlock: w.write(blob); w.flush()
+
+def _bump(st, key):
+    with stats_lock: st[key] += 1
+
+def _size(src, st):
+    # -> (tree size, None) or (None, the error); the connection is reset on error.
+    _bump(st, "sth")
+    try: return src.size(), None
+    except Exception as ex: src.conn.close(); return None, ex
+
+def _new_head(src, st, head):
+    # -> (head, stale): the old head stays, still stale, when the read fails.
+    size, _ = _size(src, st)
+    return (head, True) if size is None else (size, False)
+
+def _delay(ex, st, backoff):
+    # Seconds to wait after a failed fetch: the server's Retry-After on 429.
+    if isinstance(ex, urllib.error.HTTPError) and ex.code == 429:
+        _bump(st, "r429")
+        return retry_after(ex.headers.get("Retry-After"), datetime.datetime.now(datetime.timezone.utc), backoff)
+    _bump(st, "err")
+    return backoff
+
+def tail(log, stop, src=None, sleep=time.sleep, sink=write_out):
     src = src or source_for(log)
     st = stats[log.name]
-    try:
-        with stats_lock: st["sth"] += 1
-        cursor = src.size()                          # START FRESH at the head
-    except Exception as ex:
-        sys.stderr.write(f"  [{log.name}] initial size failed: {ex}\n"); src.conn.close(); return
-    head = cursor; backoff = 0.5; stale = False
+    head, ex = _size(src, st)                       # START FRESH at the head
+    if head is None:
+        sys.stderr.write(f"  [{log.name}] initial size failed: {ex}\n"); return
+    cursor = head; backoff = 0.5; stale = False
     while not stop.is_set():
         if cursor >= head or stale:
-            with stats_lock: st["sth"] += 1
-            try: head = src.size(); stale = False
-            except Exception: src.conn.close()
-            if cursor >= head: time.sleep(POLL); continue
-        try:
-            ders, n = src.fetch(cursor, head); backoff = 0.5
-        except urllib.error.HTTPError as he:
-            src.conn.close()
-            if he.code == 429:
-                with stats_lock: st["r429"] += 1
-                now = datetime.datetime.now(datetime.timezone.utc)
-                time.sleep(retry_after(he.headers.get("Retry-After"), now, backoff)); backoff = min(backoff*2, 30); continue
-            with stats_lock: st["err"] += 1
-            time.sleep(backoff); backoff = min(backoff*2, 30); continue
-        except Exception:
-            src.conn.close()
-            with stats_lock: st["err"] += 1
-            time.sleep(backoff); backoff = min(backoff*2, 30); continue
-        if n == 0: stale = True; time.sleep(POLL); continue
-        blob = bytearray()
-        for der in ders:
-            blob += struct.pack("<I", len(der)); blob += der
-        with wlock: w.write(blob); w.flush()
+            head, stale = _new_head(src, st, head)
+            if cursor >= head: sleep(POLL); continue
+        try: ders, n = src.fetch(cursor, head)
+        except Exception as ex:
+            src.conn.close(); sleep(_delay(ex, st, backoff)); backoff = min(backoff * 2, 30); continue
+        backoff = 0.5
+        if n == 0: stale = True; sleep(POLL); continue
+        sink(frame(ders))
         with stats_lock: st["certs"] += len(ders); st["ok"] += 1; st["bad"] = src.bad
         cursor += n
 
@@ -287,33 +307,49 @@ def reporter():
             bad = sum(s["bad"] for s in stats.values())
         sys.stderr.write(f"[tail +{time.time()-t0:.0f}s] fed {tot} certs, get-sth={sth}, 429s={r429}, errs={err}, unparsable={bad}\n"); sys.stderr.flush()
 
-def select():
-    return pick_logs(json.load(open(LOGLIST)), datetime.datetime.now(datetime.timezone.utc))
+def select(path, now):
+    with open(path) as f: return pick_logs(json.load(f), now)
+
+def listing(logs):
+    for lg in logs: sys.stderr.write(f"    {lg.kind:7} {lg.name:28} {lg.url}\n")
+    sys.stderr.flush()
+
+def banner(logs, contact):
+    if not contact: sys.stderr.write("[tail] P4MON_CONTACT unset: logs that require a contact address in the User-Agent will throttle us\n")
+    sys.stderr.write(f"[tail] FRESH START, {len(logs)} logs, tailing new certs only (no catch-up):\n")
+    listing(logs)
+
+def boot(path, fetch, now):
+    if not os.path.exists(path): refresh_loglist(path, fetch)
+    return select(path, now)
 
 def start(logs, running):
     for lg in logs:
-        sys.stderr.write(f"    {lg.kind:7} {lg.name:28} {lg.url}\n")
-        stats.setdefault(lg.name, {"ok": 0, "r429": 0, "err": 0, "certs": 0, "sth": 0, "bad": 0})
+        stats.setdefault(lg.name, new_stats())
         running[lg.url] = threading.Event()
         threading.Thread(target=tail, args=(lg, running[lg.url]), daemon=True).start()
-    sys.stderr.flush()
+
+def refresh_cycle(running, path, fetch, now, launch):
+    # New shards start, expired/retired ones stop; a bad list changes nothing.
+    if not refresh_loglist(path, fetch): return
+    new, gone = reconcile(running, select(path, now))
+    for url in gone: running.pop(url).set()
+    if new or gone:
+        sys.stderr.write(f"[tail] log list refreshed: +{len(new)} -{len(gone)} logs\n"); listing(new)
+    launch(new, running)
+
+def utcnow(): return datetime.datetime.now(datetime.timezone.utc)
 
 def main():
     signal.signal(signal.SIGTERM, lambda *a: os._exit(0))
-    if not os.path.exists(LOGLIST): refresh_loglist(LOGLIST, fetch_loglist)
-    logs = select()
-    if not CONTACT: sys.stderr.write("[tail] P4MON_CONTACT unset: logs that require a contact address in the User-Agent will throttle us\n")
-    sys.stderr.write(f"[tail] FRESH START, {len(logs)} logs, tailing new certs only (no catch-up):\n")
+    logs = boot(LOGLIST, fetch_loglist, utcnow())
+    banner(logs, CONTACT)
     running = {}
     threading.Thread(target=reporter, daemon=True).start()
     start(logs, running)
     while True:
         time.sleep(REFRESH)
-        if not refresh_loglist(LOGLIST, fetch_loglist): continue
-        new, gone = reconcile(running, select())
-        for url in gone: running.pop(url).set()
-        if new or gone: sys.stderr.write(f"[tail] log list refreshed: +{len(new)} -{len(gone)} logs\n")
-        start(new, running)
+        refresh_cycle(running, LOGLIST, fetch_loglist, utcnow(), start)
 
 if __name__ == "__main__":
     main()
