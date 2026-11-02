@@ -31,6 +31,29 @@ Scales with CT issuance volume. Measured on AWS m7g.large (aarch64), 16 CT logs 
     ./target/release/p4mon cert <file>         # -> WEAK d=<n> | clean
     python3 ct_tail_live.py | ./target/release/p4mon stream table.bin   # live tail
 
+### CT tailer (`ct_tail_live.py`)
+Reads both kinds of log in the Chrome log list: RFC 6962 logs (`get-sth` /
+`get-entries`) and static-ct-api "tiled" logs (`checkpoint` / `tile/data`, e.g.
+Let's Encrypt, Sectigo, Geomys, IPng). For tiled logs, issuer certificates are
+fetched by fingerprint, checked against it, and emitted once per process across
+all logs; leaves seen in several logs are skipped by `DEDUP` downstream. The
+log list is re-read every day, so new shards start and expired ones stop
+without a restart. It starts at each log's head (no catch-up).
+
+| variable | default | meaning |
+|---|---|---|
+| `P4MON_CONTACT` | unset | contact address added to the User-Agent; Geomys/Sunlight logs throttle readers without one |
+| `P4MON_MAXLOGS` | 16 | logs tailed in total (0 = every current log, 56 as of Nov 2026) |
+| `P4MON_MAX_PER_OP` | 4 | logs per operator (0 = no cap) |
+| `P4MON_WINDOW_DAYS` | 400 | tail shards whose expiry window overlaps the next N days |
+| `P4MON_POLL_SEC` | 10 | idle head-poll interval once caught up |
+| `P4MON_PARTIAL_WAIT_SEC` | 60 | how long to wait for a tiled log's partial tile to fill before reading it |
+| `P4MON_LOGLIST` | `loglist.json` | log list path; fetched at start if missing |
+| `P4MON_LOGLIST_URL` | Chrome v3 list | where the list is fetched from |
+| `P4MON_LOGLIST_REFRESH_SEC` | 86400 | log list refresh interval |
+
+Tests: `python3 -m unittest discover -s p4mon/tests` (from the repository root).
+
 ### Deploy (systemd)
 Units assume the checkout is at `/home/ec2-user/p4-inventory/p4mon`; adjust paths otherwise.
 
@@ -42,7 +65,8 @@ Units assume the checkout is at `/home/ec2-user/p4-inventory/p4mon`; adjust path
     sudo systemctl daemon-reload
     sudo systemctl enable --now p4mon-ct.service p4mon-find.path p4mon-report.timer
 
-`p4mon-ct` auto-fetches `loglist.json` if missing (ExecStartPre). Alerts (find +
+`p4mon-ct` fetches `loglist.json` if missing and refreshes it daily; set
+`P4MON_CONTACT` in the unit. Alerts (find +
 daily) deliver via Apprise to whatever targets you list in
 `~/.config/p4mon/apprise.txt` — email, ntfy, Pushover, Telegram, Slack, webhook,
 etc. (see `apprise.txt.example`). No LLM involved. With no target configured, the
