@@ -226,5 +226,31 @@ class PickLogs(unittest.TestCase):
         self.assertEqual(len(t.pick_logs(self.data, self.now, max_logs=2, max_per_op=0)), 2)
 
 
+class UserAgent(unittest.TestCase):
+    def test_contact_is_appended_when_set(self):
+        self.assertEqual(t.user_agent(""), t.UA)
+        self.assertEqual(t.user_agent("ops@example.org"), t.UA + " (ops@example.org)")
+
+
+class RetryAfter(unittest.TestCase):
+    NOW = datetime.datetime(2026, 11, 2, 21, 24, 0, tzinfo=datetime.timezone.utc)
+
+    def test_seconds_form(self):
+        self.assertEqual(t.retry_after("7", self.NOW, 0.5), 7.0)
+
+    def test_http_date_form(self):
+        self.assertEqual(t.retry_after("Mon, 02 Nov 2026 21:24:44 GMT", self.NOW, 0.5), 44.0)
+
+    def test_past_date_means_now(self):
+        self.assertEqual(t.retry_after("Mon, 02 Nov 2026 21:20:00 GMT", self.NOW, 0.5), 0.0)
+
+    def test_missing_or_garbage_falls_back(self):
+        self.assertEqual(t.retry_after(None, self.NOW, 0.5), 0.5)
+        self.assertEqual(t.retry_after("soon", self.NOW, 0.5), 0.5)
+
+    def test_absurd_wait_is_capped(self):
+        self.assertEqual(t.retry_after("86400", self.NOW, 0.5), t.MAX_RETRY_AFTER)
+
+
 if __name__ == "__main__":
     unittest.main()

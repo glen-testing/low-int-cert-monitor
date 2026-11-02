@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import json, threading, time, base64, struct, urllib.request, urllib.error, urllib.parse, http.client, sys, os, signal, datetime, gzip, hashlib
+import json, threading, time, base64, struct, urllib.request, urllib.error, urllib.parse, http.client, sys, os, signal, datetime, gzip, hashlib, email.utils
 from typing import NamedTuple
 UA = "p4mon-ct-weakkey-monitor/0.1"
 BATCH = 256
@@ -10,9 +10,24 @@ MAX_PER_OP = int(os.environ.get("P4MON_MAX_PER_OP", "4"))
 POLL = float(os.environ.get("P4MON_POLL_SEC", "10"))   # idle get-sth / checkpoint interval once caught up
 PARTIAL_WAIT = float(os.environ.get("P4MON_PARTIAL_WAIT_SEC", "60"))  # max wait for a static-ct tile to fill
 LOGLIST = os.environ.get("P4MON_LOGLIST", "loglist.json")
+# Some logs (Geomys/Sunlight) throttle readers whose User-Agent has no contact
+# address: "429 Please add an email address to your User-Agent."
+CONTACT = os.environ.get("P4MON_CONTACT", "")
+MAX_RETRY_AFTER = 300.0
 wlock = threading.Lock(); w = sys.stdout.buffer; t0 = time.time()
 stats_lock = threading.Lock()
 stats = {}
+
+def user_agent(contact):
+    return f"{UA} ({contact})" if contact else UA
+
+def retry_after(value, now, default):
+    # Retry-After is either delay-seconds or an HTTP-date (RFC 9110 10.2.3).
+    try:
+        secs = float(value) if value.isdigit() else (email.utils.parsedate_to_datetime(value) - now).total_seconds()
+    except (AttributeError, TypeError, ValueError):
+        return default
+    return min(max(secs, 0.0), MAX_RETRY_AFTER)
 
 class Log(NamedTuple):
     name: str
@@ -33,7 +48,7 @@ class Conn:
         if self.c is None:
             self.c = http.client.HTTPSConnection(self.host, timeout=20)
         self.c.request("GET", self.prefix + suffix, headers={
-            "User-Agent": UA, "Connection": "keep-alive", "Accept-Encoding": "gzip, identity"})
+            "User-Agent": user_agent(CONTACT), "Connection": "keep-alive", "Accept-Encoding": "gzip, identity"})
         r = self.c.getresponse(); body = r.read()
         if r.status != 200:
             raise urllib.error.HTTPError(self.prefix + suffix, r.status, r.reason, r.headers, None)
@@ -223,8 +238,8 @@ def tail(log):
             src.conn.close()
             if he.code == 429:
                 with stats_lock: st["r429"] += 1
-                ra = he.headers.get("Retry-After")
-                time.sleep(float(ra) if (ra and ra.isdigit()) else backoff); backoff = min(backoff*2, 30); continue
+                now = datetime.datetime.now(datetime.timezone.utc)
+                time.sleep(retry_after(he.headers.get("Retry-After"), now, backoff)); backoff = min(backoff*2, 30); continue
             with stats_lock: st["err"] += 1
             time.sleep(backoff); backoff = min(backoff*2, 30); continue
         except Exception:
@@ -251,6 +266,7 @@ def reporter():
 def main():
     signal.signal(signal.SIGTERM, lambda *a: os._exit(0))
     logs = pick_logs(json.load(open(LOGLIST)), datetime.datetime.now(datetime.timezone.utc))
+    if not CONTACT: sys.stderr.write("[tail] P4MON_CONTACT unset: logs that require a contact address in the User-Agent will throttle us\n")
     sys.stderr.write(f"[tail] FRESH START, {len(logs)} logs, tailing new certs only (no catch-up):\n")
     for lg in logs: sys.stderr.write(f"    {lg.kind:7} {lg.name:28} {lg.url}\n")
     sys.stderr.flush()
