@@ -10,6 +10,8 @@ MAX_PER_OP = int(os.environ.get("P4MON_MAX_PER_OP", "4"))
 POLL = float(os.environ.get("P4MON_POLL_SEC", "10"))   # idle get-sth / checkpoint interval once caught up
 PARTIAL_WAIT = float(os.environ.get("P4MON_PARTIAL_WAIT_SEC", "60"))  # max wait for a static-ct tile to fill
 LOGLIST = os.environ.get("P4MON_LOGLIST", "loglist.json")
+LOGLIST_URL = os.environ.get("P4MON_LOGLIST_URL", "https://www.gstatic.com/ct/log_list/v3/log_list.json")
+REFRESH = float(os.environ.get("P4MON_LOGLIST_REFRESH_SEC", "86400"))  # re-read the log list (new shards, retirements)
 # Some logs (Geomys/Sunlight) throttle readers whose User-Agent has no contact
 # address: "429 Please add an email address to your User-Agent."
 CONTACT = os.environ.get("P4MON_CONTACT", "")
@@ -217,8 +219,8 @@ def source_for(log):
     conn = Conn(log.url)
     return Rfc6962(conn) if log.kind == "rfc6962" else StaticCT(conn, ISSUERS, log.name)
 
-def tail(log):
-    src = source_for(log)
+def tail(log, stop, src=None):
+    src = src or source_for(log)
     st = stats[log.name]
     try:
         with stats_lock: st["sth"] += 1
@@ -226,7 +228,7 @@ def tail(log):
     except Exception as ex:
         sys.stderr.write(f"  [{log.name}] initial size failed: {ex}\n"); src.conn.close(); return
     head = cursor; backoff = 0.5; stale = False
-    while True:
+    while not stop.is_set():
         if cursor >= head or stale:
             with stats_lock: st["sth"] += 1
             try: head = src.size(); stale = False
@@ -254,6 +256,28 @@ def tail(log):
         with stats_lock: st["certs"] += len(ders); st["ok"] += 1; st["bad"] = src.bad
         cursor += n
 
+def refresh_loglist(path, fetch):
+    # Replace the log list only with one that parses; keep the old one otherwise.
+    try:
+        body = fetch(); data = json.loads(body)
+        if not isinstance(data.get("operators"), list): raise ValueError("no operators")
+    except Exception as ex:
+        sys.stderr.write(f"[tail] log list refresh failed, keeping {path}: {ex}\n"); return False
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f: f.write(body)
+    os.replace(tmp, path)
+    return True
+
+def fetch_loglist():
+    req = urllib.request.Request(LOGLIST_URL, headers={"User-Agent": user_agent(CONTACT)})
+    with urllib.request.urlopen(req, timeout=30) as r: return r.read()
+
+def reconcile(running, picked):
+    # -> (logs to start, urls to stop). Logs that left the selection (shard
+    # expired, log retired, cap) stop; newly selected ones start.
+    want = {lg.url for lg in picked}
+    return [lg for lg in picked if lg.url not in running], set(running) - want
+
 def reporter():
     while True:
         time.sleep(60)
@@ -263,17 +287,33 @@ def reporter():
             bad = sum(s["bad"] for s in stats.values())
         sys.stderr.write(f"[tail +{time.time()-t0:.0f}s] fed {tot} certs, get-sth={sth}, 429s={r429}, errs={err}, unparsable={bad}\n"); sys.stderr.flush()
 
+def select():
+    return pick_logs(json.load(open(LOGLIST)), datetime.datetime.now(datetime.timezone.utc))
+
+def start(logs, running):
+    for lg in logs:
+        sys.stderr.write(f"    {lg.kind:7} {lg.name:28} {lg.url}\n")
+        stats.setdefault(lg.name, {"ok": 0, "r429": 0, "err": 0, "certs": 0, "sth": 0, "bad": 0})
+        running[lg.url] = threading.Event()
+        threading.Thread(target=tail, args=(lg, running[lg.url]), daemon=True).start()
+    sys.stderr.flush()
+
 def main():
     signal.signal(signal.SIGTERM, lambda *a: os._exit(0))
-    logs = pick_logs(json.load(open(LOGLIST)), datetime.datetime.now(datetime.timezone.utc))
+    if not os.path.exists(LOGLIST): refresh_loglist(LOGLIST, fetch_loglist)
+    logs = select()
     if not CONTACT: sys.stderr.write("[tail] P4MON_CONTACT unset: logs that require a contact address in the User-Agent will throttle us\n")
     sys.stderr.write(f"[tail] FRESH START, {len(logs)} logs, tailing new certs only (no catch-up):\n")
-    for lg in logs: sys.stderr.write(f"    {lg.kind:7} {lg.name:28} {lg.url}\n")
-    sys.stderr.flush()
-    for lg in logs: stats[lg.name] = {"ok": 0, "r429": 0, "err": 0, "certs": 0, "sth": 0, "bad": 0}
+    running = {}
     threading.Thread(target=reporter, daemon=True).start()
-    for lg in logs: threading.Thread(target=tail, args=(lg,), daemon=True).start()
-    while True: time.sleep(3600)
+    start(logs, running)
+    while True:
+        time.sleep(REFRESH)
+        if not refresh_loglist(LOGLIST, fetch_loglist): continue
+        new, gone = reconcile(running, select())
+        for url in gone: running.pop(url).set()
+        if new or gone: sys.stderr.write(f"[tail] log list refreshed: +{len(new)} -{len(gone)} logs\n")
+        start(new, running)
 
 if __name__ == "__main__":
     main()

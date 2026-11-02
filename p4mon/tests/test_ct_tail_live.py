@@ -1,8 +1,10 @@
 import datetime
 import gzip
 import hashlib
+import json
 import os
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -224,6 +226,36 @@ class PickLogs(unittest.TestCase):
         self.assertEqual([lg.name for lg in t.pick_logs(self.data, self.now, max_logs=0, max_per_op=1)],
                          ["A rfc", "B tiles"])
         self.assertEqual(len(t.pick_logs(self.data, self.now, max_logs=2, max_per_op=0)), 2)
+
+
+class Reconcile(unittest.TestCase):
+    def test_new_logs_start_and_dropped_logs_stop(self):
+        a, b, c = (t.Log(n, "static", "https://" + n) for n in "abc")
+        start, stop = t.reconcile({a.url, b.url}, [b, c])
+        self.assertEqual(start, [c])
+        self.assertEqual(stop, {a.url})
+
+
+class StopEvent(unittest.TestCase):
+    def test_tail_returns_when_stopped(self):
+        import threading
+        stop = threading.Event(); stop.set()
+        src = t.StaticCT(FakeConn({"checkpoint": b"o\n5\nAAAA\n\n- sig\n"}), t.IssuerCache())
+        t.stats["stopped"] = {"ok": 0, "r429": 0, "err": 0, "certs": 0, "sth": 0, "bad": 0}
+        t.tail(t.Log("stopped", "static", "https://x/"), stop, src)
+        self.assertEqual(src.conn.requested, ["checkpoint"])
+
+
+class RefreshLoglist(unittest.TestCase):
+    def test_valid_list_replaces_file_and_invalid_keeps_it(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "loglist.json")
+            self.assertTrue(t.refresh_loglist(path, lambda: b'{"operators": []}'))
+            self.assertEqual(json.load(open(path)), {"operators": []})
+            self.assertFalse(t.refresh_loglist(path, lambda: b"<html>oops"))
+            self.assertEqual(json.load(open(path)), {"operators": []})
+            self.assertFalse(t.refresh_loglist(path, lambda: b'{"no": "operators"}'))
+            self.assertEqual(json.load(open(path)), {"operators": []})
 
 
 class UserAgent(unittest.TestCase):
