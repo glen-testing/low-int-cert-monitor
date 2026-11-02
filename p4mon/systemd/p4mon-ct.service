@@ -9,6 +9,8 @@ User=ec2-user
 WorkingDirectory=/home/ec2-user/p4-inventory/p4mon
 Environment=DEDUP=1
 Environment=P4MON_FINDINGS=/home/ec2-user/p4-inventory/p4mon/findings.jsonl
+# contact address for the CT logs' operators (Geomys/Sunlight logs throttle without one)
+#Environment=P4MON_CONTACT=you@example.org
 # fetch the CT log list (drives shard selection) if missing, before starting
 ExecStartPre=/bin/sh -c 'test -s loglist.json || curl -fsS --max-time 30 -o loglist.json https://www.gstatic.com/ct/log_list/v3/log_list.json'
 ExecStart=/bin/bash -c 'exec python3 ct_tail_live.py | DEDUP=1 P4MON_FINDINGS=/home/ec2-user/p4-inventory/p4mon/findings.jsonl ./target/release/p4mon stream table.bin'
