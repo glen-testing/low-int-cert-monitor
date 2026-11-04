@@ -143,6 +143,132 @@ fn der_subject(der: &[u8]) -> String {
     X509Certificate::from_der(der).map(|(_, c)| c.subject().to_string()).unwrap_or_default()
 }
 
+// ---- certificate scope: which sites a flagged cert is valid for --------------
+const MAX_NAMES: usize = 50;
+
+#[derive(Debug, Default, PartialEq)]
+struct Scope {
+    ca: bool,
+    tls_server: bool, // EKU absent, anyExtendedKeyUsage, or serverAuth
+    names: Vec<String>,
+    names_omitted: usize, // SAN entries dropped: not a strict hostname, or over MAX_NAMES
+    permitted: Vec<String>,
+    excluded: Vec<String>,
+}
+
+// Strict LDH hostname (optional leading "*." or, for name constraints, "."). Anything
+// else is dropped, so attacker-chosen SAN text never reaches an alert body.
+fn hostname(s: &str, constraint: bool) -> Option<String> {
+    let s = s.to_ascii_lowercase();
+    let mut body = s.trim_end_matches('.');
+    let mut prefix = "";
+    if let Some(r) = body.strip_prefix("*.") { prefix = "*."; body = r; }
+    else if constraint { if let Some(r) = body.strip_prefix('.') { prefix = "."; body = r; } }
+    if body.is_empty() || body.len() > 253 { return None; }
+    let ok = body.split('.').all(|l| {
+        !l.is_empty() && l.len() <= 63 && !l.starts_with('-') && !l.ends_with('-')
+            && l.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+    });
+    ok.then(|| format!("{prefix}{body}"))
+}
+
+fn ip_string(b: &[u8]) -> Option<String> {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+    let prefix = |m: &[u8]| -> String {
+        let ones: u32 = m.iter().map(|x| x.count_ones()).sum();
+        let contiguous = m.iter().flat_map(|x| (0..8).rev().map(move |i| x >> i & 1)).skip_while(|&bit| bit == 1).all(|bit| bit == 0);
+        if contiguous { format!("/{ones}") } else { " mask ".to_string() + &m.iter().map(|x| format!("{x:02x}")).collect::<String>() }
+    };
+    match b.len() {
+        4 => Some(Ipv4Addr::from(<[u8; 4]>::try_from(b).ok()?).to_string()),
+        16 => Some(Ipv6Addr::from(<[u8; 16]>::try_from(b).ok()?).to_string()),
+        8 => Some(format!("{}{}", Ipv4Addr::from(<[u8; 4]>::try_from(&b[..4]).ok()?), prefix(&b[4..]))),
+        32 => Some(format!("{}{}", Ipv6Addr::from(<[u8; 16]>::try_from(&b[..16]).ok()?), prefix(&b[16..]))),
+        _ => None,
+    }
+}
+
+fn general_name(g: &x509_parser::extensions::GeneralName, constraint: bool) -> Option<String> {
+    use x509_parser::extensions::GeneralName;
+    match g {
+        GeneralName::DNSName(s) => hostname(s, constraint),
+        GeneralName::IPAddress(b) => ip_string(b),
+        _ => None,
+    }
+}
+
+// Only called on a weak hit (rare).
+fn der_scope(der: &[u8]) -> Scope {
+    use x509_parser::prelude::*;
+    let Ok((_, cert)) = X509Certificate::from_der(der) else { return Scope::default() };
+    let mut s = Scope {
+        ca: matches!(cert.basic_constraints(), Ok(Some(bc)) if bc.value.ca),
+        tls_server: match cert.extended_key_usage() {
+            Ok(Some(e)) => e.value.any || e.value.server_auth,
+            _ => true,
+        },
+        ..Scope::default()
+    };
+    let push = |s: &mut Scope, n: Option<String>| match n {
+        Some(n) if s.names.len() < MAX_NAMES => { if !s.names.contains(&n) { s.names.push(n); } }
+        _ => s.names_omitted += 1,
+    };
+    match cert.subject_alternative_name() {
+        Ok(Some(san)) => {
+            for g in &san.value.general_names {
+                match g {
+                    GeneralName::DNSName(_) | GeneralName::IPAddress(_) => push(&mut s, general_name(g, false)),
+                    _ => {} // email, URI, etc. are not sites
+                }
+            }
+        }
+        _ => {
+            // Legacy cert without SAN: the CN counts only if it is a hostname.
+            if let Some(cn) = cert.subject().iter_common_name().next().and_then(|c| c.as_str().ok()) {
+                if let Some(h) = hostname(cn, false) { s.names.push(h); }
+            }
+        }
+    }
+    if let Ok(Some(nc)) = cert.name_constraints() {
+        let list = |v: &Option<Vec<x509_parser::extensions::GeneralSubtree>>| -> Vec<String> {
+            v.iter().flatten().filter_map(|t| general_name(&t.base, true)).take(MAX_NAMES).collect()
+        };
+        s.permitted = list(&nc.value.permitted_subtrees);
+        s.excluded = list(&nc.value.excluded_subtrees);
+    }
+    s
+}
+
+fn json_list(v: &[String]) -> String {
+    format!("[{}]", v.iter().map(|x| format!("\"{x}\"")).collect::<Vec<_>>().join(","))
+}
+
+fn scope_json(s: &Scope) -> String {
+    format!(
+        "\"ca\":{},\"tls_server\":{},\"names\":{},\"names_omitted\":{},\"permitted\":{},\"excluded\":{}",
+        s.ca, s.tls_server, json_list(&s.names), s.names_omitted, json_list(&s.permitted), json_list(&s.excluded)
+    )
+}
+
+fn scope_text(s: &Scope) -> String {
+    if !s.tls_server {
+        return "valid for: no websites (extended key usage excludes TLS server auth)".into();
+    }
+    if s.ca {
+        return if s.permitted.is_empty() {
+            "valid for: ANY website (CA certificate without name constraints)".into()
+        } else {
+            let ex = if s.excluded.is_empty() { String::new() } else { format!("; excluding {}", s.excluded.join(", ")) };
+            format!("valid for: names under {}{ex} (name-constrained CA)", s.permitted.join(", "))
+        };
+    }
+    if s.names.is_empty() {
+        return "valid for: no hostnames listed".into();
+    }
+    let more = if s.names_omitted > 0 { format!(" (+{} omitted)", s.names_omitted) } else { String::new() };
+    format!("valid for: {}{more}", s.names.join(", "))
+}
+
 fn rss_mb() -> f64 {
     if let Ok(s) = std::fs::read_to_string("/proc/self/status") {
         for line in s.lines() {
@@ -348,14 +474,15 @@ fn stream(tbl: &str, sample: u64) -> i32 {
         if let Some(d) = d {
             weak.fetch_add(1, Relaxed);
             let subj = der_subject(&buf);
-            println!("WEAK  d={}  {}", d, subj);
+            let scope = der_scope(&buf);
+            println!("WEAK  d={}  {}  {}", d, subj, scope_text(&scope));
             if let Some(f) = findings.as_mut() {
                 use std::io::Write;
                 use sha2::{Sha256, Digest};
                 let fp: String = Sha256::digest(&buf).iter().map(|b| format!("{:02x}", b)).collect();
                 let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|x| x.as_secs()).unwrap_or(0);
                 let subj_safe: String = subj.chars().map(|c| if c == ' ' || c.is_ascii_graphic() { c } else { '.' }).collect();
-                let _ = writeln!(f, "{{\"ts\":{},\"d\":{},\"sha256\":{:?},\"subject\":{:?}}}", ts, d, fp, subj_safe);
+                let _ = writeln!(f, "{{\"ts\":{},\"d\":{},\"sha256\":{:?},\"subject\":{:?},{}}}", ts, d, fp, subj_safe, scope_json(&scope));
                 let _ = f.flush();
             }
         }
@@ -379,7 +506,7 @@ fn cert_one(path: &str, tbl: &str) -> i32 {
     let (is_ec, d) = check_der(&t, &der);
     if !is_ec { println!("not an EC key on a supported curve (P-256/384/521)"); return 0; }
     match d {
-        Some(d) => println!("WEAK  d={}  {}", d, der_subject(&der)),
+        Some(d) => println!("WEAK  d={}  {}  {}", d, der_subject(&der), scope_text(&der_scope(&der))),
         None => println!("clean (no small d <= {})  {}", MAXD, der_subject(&der)),
     }
     0
@@ -404,4 +531,88 @@ fn main() {
         _ => { eprintln!("p4mon <build|selftest|bench|scan|cert> ..."); 1 }
     };
     std::process::exit(code);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    macro_rules! fx { ($n:literal) => { der_scope(include_bytes!(concat!("../tests/fixtures/", $n, ".der"))) }; }
+
+    #[test]
+    fn tp_leaf_lists_dns_and_ip_sans() {
+        let s = fx!("leaf_sans");
+        assert_eq!(s.names, vec!["www.example.com", "*.example.org", "192.0.2.1", "2001:db8::1"]);
+        assert!(!s.ca && s.tls_server && s.names_omitted == 0);
+        assert_eq!(scope_text(&s), "valid for: www.example.com, *.example.org, 192.0.2.1, 2001:db8::1");
+    }
+
+    #[test]
+    fn tp_legacy_cn_used_without_san() {
+        assert_eq!(fx!("leaf_cn_only").names, vec!["legacy.example.net"]);
+    }
+
+    #[test]
+    fn fp_cn_that_is_not_a_hostname() {
+        let s = fx!("leaf_cn_not_host");
+        assert!(s.names.is_empty());
+        assert_eq!(scope_text(&s), "valid for: no hostnames listed");
+    }
+
+    #[test]
+    fn tp_unconstrained_ca_is_any_website() {
+        let s = fx!("ca_open");
+        assert!(s.ca && s.tls_server);
+        assert_eq!(scope_text(&s), "valid for: ANY website (CA certificate without name constraints)");
+    }
+
+    #[test]
+    fn tp_name_constrained_ca() {
+        let s = fx!("ca_constrained");
+        assert_eq!(s.permitted, vec![".example.com", "10.0.0.0/8"]);
+        assert_eq!(s.excluded, vec!["bad.example.com"]);
+        assert!(scope_text(&s).starts_with("valid for: names under .example.com, 10.0.0.0/8; excluding bad.example.com"));
+    }
+
+    #[test]
+    fn fp_code_signing_ca_not_valid_for_websites() {
+        let s = fx!("ca_codesign");
+        assert!(s.ca && !s.tls_server);
+        assert_eq!(scope_text(&s), "valid for: no websites (extended key usage excludes TLS server auth)");
+    }
+
+    #[test]
+    fn fp_hostile_san_text_dropped() {
+        let s = fx!("leaf_hostile");
+        assert_eq!(s.names, vec!["evilx07.test", "ok.example.com"]);
+        assert_eq!(s.names_omitted, 3);
+        let j = scope_json(&s);
+        assert!(!j.contains("ignore") && !j.contains(' '), "{j}");
+    }
+
+    #[test]
+    fn names_capped() {
+        let s = fx!("leaf_many");
+        assert_eq!((s.names.len(), s.names_omitted), (MAX_NAMES, 10));
+        assert!(scope_text(&s).ends_with("(+10 omitted)"));
+    }
+
+    #[test]
+    fn hostname_rules() {
+        assert_eq!(hostname("WWW.Example.COM.", false).as_deref(), Some("www.example.com"));
+        assert_eq!(hostname(".example.com", true).as_deref(), Some(".example.com"));
+        for bad in [".example.com", "a b.com", "evil\x07.com", "x\"y.com", "", "*.", "a..b", "-a.com", &"a".repeat(64)] {
+            assert_eq!(hostname(bad, false), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn scope_json_is_valid_json_fragment() {
+        let j = format!("{{{}}}", scope_json(&fx!("leaf_sans")));
+        assert_eq!(j, r#"{"ca":false,"tls_server":true,"names":["www.example.com","*.example.org","192.0.2.1","2001:db8::1"],"names_omitted":0,"permitted":[],"excluded":[]}"#);
+    }
+
+    #[test]
+    fn fp_garbage_der_gives_empty_scope() {
+        assert_eq!(der_scope(b"\x30\x03\x01\x01\x00"), Scope::default());
+    }
 }

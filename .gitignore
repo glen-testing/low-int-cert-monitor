@@ -10,3 +10,4 @@ loglist.json
 *.csv
 findings.jsonl
 .find_last
+!p4mon/tests/fixtures/*.der
