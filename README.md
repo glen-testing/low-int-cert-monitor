@@ -28,8 +28,17 @@ Scales with CT issuance volume. Measured on AWS m7g.large (aarch64), 16 CT logs 
     curl -fsSo loglist.json https://www.gstatic.com/ct/log_list/v3/log_list.json
     ./target/release/p4mon build table.bin     # precompute d*G, d=1..1_000_000 (~80s, once)
     ./target/release/p4mon selftest            # known-answer gate
-    ./target/release/p4mon cert <file>         # -> WEAK d=<n> | clean
+    ./target/release/p4mon cert <file>         # -> WEAK d=<n> <subject> valid for: ... | clean
     python3 ct_tail_live.py | ./target/release/p4mon stream table.bin   # live tail
+    cargo test --release && python3 -m unittest test_report.py           # tests
+
+Each hit appends one JSON line to `findings.jsonl` (`ts`, `d`, `sha256`,
+`subject`) plus the certificate's scope: `ca`, `tls_server` (extended key usage
+allows TLS server auth), `names` (SAN DNS names and IPs, legacy CN if there is no
+SAN), `names_omitted`, and name-constraint `permitted`/`excluded` lists. Alerts
+turn that into a "valid for" line: the hostnames for a leaf, "ANY website" for a
+CA without name constraints, or "no websites" when the key usage excludes TLS.
+Only strict hostnames and IPs are kept; other SAN text is dropped and counted.
 
 ### Deploy (systemd)
 Units assume the checkout is at `/home/ec2-user/p4-inventory/p4mon`; adjust paths otherwise.
