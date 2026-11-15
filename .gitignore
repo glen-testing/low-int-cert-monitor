@@ -5,6 +5,8 @@ build/
 __pycache__/
 *.pyc
 loglist.json
+loglist.json.sig
+*.tmp
 *.der
 *.log
 *.csv

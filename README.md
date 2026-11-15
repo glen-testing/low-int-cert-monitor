@@ -40,6 +40,41 @@ turn that into a "valid for" line: the hostnames for a leaf, "ANY website" for a
 CA without name constraints, or "no websites" when the key usage excludes TLS.
 Only strict hostnames and IPs are kept; other SAN text is dropped and counted.
 
+### CT tailer (`ct_tail_live.py`)
+Reads both kinds of log in the Chrome log list: RFC 6962 logs (`get-sth` /
+`get-entries`) and static-ct-api "tiled" logs (`checkpoint` / `tile/data`, e.g.
+Let's Encrypt, Sectigo, Geomys, IPng). For tiled logs, issuer certificates are
+fetched by fingerprint, checked against it, and emitted once per process across
+all logs; leaves seen in several logs are skipped by `DEDUP` downstream. The
+log list is re-read every day, so new shards start and expired ones stop
+without a restart; a list is used only if its `log_list.sig` verifies against
+Chrome's key, pinned in `p4mon/log_list_pubkey.pem` (SHA-256 of the DER key
+`f1d8b68e…62e6fd85`), it is not older than the stored list, and it selects at
+least one log (otherwise the tailer keeps the old list, or exits at start). Response bodies are limited before and after gzip, and an
+issuer that keeps failing is skipped for a while so it cannot stall its log. It
+starts at each log's head (no catch-up). Every 60 s it logs certs fed and HTTP
+requests made, cumulative and per second.
+
+| variable | default | meaning |
+|---|---|---|
+| `P4MON_CONTACT` | unset | contact address added to the User-Agent; Geomys/Sunlight logs throttle readers without one |
+| `P4MON_MAXLOGS` | 16 | logs tailed in total (0 = every current log, 56 as of Nov 2026) |
+| `P4MON_MAX_PER_OP` | 4 | logs per operator (0 = no cap) |
+| `P4MON_WINDOW_DAYS` | 400 | tail shards whose expiry window overlaps the next N days |
+| `P4MON_POLL_SEC` | 10 | idle head-poll interval once caught up |
+| `P4MON_PARTIAL_WAIT_SEC` | 60 | how long to wait for a tiled log's partial tile to fill before reading it |
+| `P4MON_LOGLIST` | `loglist.json` | log list path; fetched at start if missing |
+| `P4MON_LOGLIST_URL` | Chrome v3 list | where the list is fetched from |
+| `P4MON_LOGLIST_REFRESH_SEC` | 86400 | log list refresh interval |
+| `P4MON_LOGLIST_SIG_URL` | Chrome v3 `log_list.sig` | signature over the list |
+| `P4MON_LOGLIST_PUBKEY` | `log_list_pubkey.pem` beside the script | key the signature must verify against |
+| `P4MON_MAX_TILE_BYTES` | 3200000 | tile / issuer / checkpoint body limit (5x the largest tile seen, 631,255 B) |
+| `P4MON_MAX_JSON_BYTES` | 8500000 | RFC 6962 JSON body limit (5x the largest `get-entries` seen, 1,690,418 B) |
+| `P4MON_ISSUER_MAX_FAILS` | 3 | consecutive failures before an issuer is skipped |
+| `P4MON_ISSUER_COOLDOWN_SEC` | 3600 | how long a failing issuer is skipped before one more try |
+
+Tests: `python3 -m unittest discover -s p4mon/tests` (from the repository root).
+
 ### Deploy (systemd)
 Units assume the checkout is at `/home/ec2-user/p4-inventory/p4mon`; adjust paths otherwise.
 
@@ -51,7 +86,9 @@ Units assume the checkout is at `/home/ec2-user/p4-inventory/p4mon`; adjust path
     sudo systemctl daemon-reload
     sudo systemctl enable --now p4mon-ct.service p4mon-find.path p4mon-report.timer
 
-`p4mon-ct` auto-fetches `loglist.json` if missing (ExecStartPre). Alerts (find +
+`p4mon-ct` fetches `loglist.json` (and `loglist.json.sig`) when missing or
+unverified and refreshes it daily; set
+`P4MON_CONTACT` in the unit. Alerts (find +
 daily) deliver via Apprise to whatever targets you list in
 `~/.config/p4mon/apprise.txt` — email, ntfy, Pushover, Telegram, Slack, webhook,
 etc. (see `apprise.txt.example`). No LLM involved. With no target configured, the
