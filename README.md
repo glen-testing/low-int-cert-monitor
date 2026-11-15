@@ -40,7 +40,8 @@ all logs; leaves seen in several logs are skipped by `DEDUP` downstream. The
 log list is re-read every day, so new shards start and expired ones stop
 without a restart; a list is used only if its `log_list.sig` verifies against
 Chrome's key, pinned in `p4mon/log_list_pubkey.pem` (SHA-256 of the DER key
-`f1d8b68e…62e6fd85`). Response bodies are limited before and after gzip, and an
+`f1d8b68e…62e6fd85`), it is not older than the stored list, and it selects at
+least one log (otherwise the tailer keeps the old list, or exits at start). Response bodies are limited before and after gzip, and an
 issuer that keeps failing is skipped for a while so it cannot stall its log. It
 starts at each log's head (no catch-up). Every 60 s it logs certs fed and HTTP
 requests made, cumulative and per second.

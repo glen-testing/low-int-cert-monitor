@@ -37,6 +37,11 @@ reqs = [0]                                       # HTTP requests to CT logs, all
 class TooLarge(Exception):
     """A response over its byte limit. Permanent for an immutable tile or range."""
 
+class BadEncoding(Exception):
+    """A fully received body that does not decode (corrupt or truncated gzip)."""
+
+MAX_GZIP_MEMBERS = 64
+
 def user_agent(contact):
     return f"{UA} ({contact})" if contact else UA
 
@@ -62,14 +67,17 @@ def decode_body(body, encoding, limit):
     # static-ct logs MAY gzip data tiles with no negotiation; RFC 6962 logs may too.
     # Inflate at most limit+1 bytes, so a decompression bomb costs only the limit.
     if (encoding or "").lower() != "gzip": return body
-    out = b""
+    out = bytearray(); members = 0
     while body:                                  # one or more gzip members
+        members += 1
+        if members > MAX_GZIP_MEMBERS: raise BadEncoding(f"over {MAX_GZIP_MEMBERS} gzip members")
         d = zlib.decompressobj(16 + zlib.MAX_WBITS)
-        out += d.decompress(body, limit + 1 - len(out))
+        try: out += d.decompress(body, limit + 1 - len(out))
+        except zlib.error as ex: raise BadEncoding(f"corrupt gzip body: {ex}")
         if len(out) > limit or d.unconsumed_tail: raise TooLarge(f"gzip body over {limit} bytes")
-        if not d.eof: raise EOFError("truncated gzip body")
-        body = d.unused_data
-    return out
+        if not d.eof: raise BadEncoding("truncated gzip body")
+        body = d.unused_data.lstrip(b"\0")      # trailing zero padding, as gzip.decompress allows
+    return bytes(out)
 
 class Conn:
     # One persistent keep-alive HTTPS connection per log thread (reused across
@@ -173,8 +181,8 @@ class Rfc6962:
     def fetch(self, cursor, head):
         end = min(cursor + BATCH - 1, head - 1)
         try: es = self.conn.get(f"ct/v1/get-entries?start={cursor}&end={end}")["entries"]
-        except TooLarge as ex:
-            # Retrying the same range would hit the same limit: skip it, loudly.
+        except (TooLarge, BadEncoding) as ex:
+            # Retrying the same range would fail the same way: skip it, loudly.
             self.conn.close(); self.bad += 1
             sys.stderr.write(f"  [{self.name}] entries {cursor}-{end}: {ex}; skipped\n")
             return [], end - cursor + 1
@@ -208,8 +216,8 @@ class StaticCT:
         if width == 0: return [], 0
         n, skip = divmod(cursor, TILE)
         try: body = self.conn.raw(f"tile/data/{tile_path(n)}" + ("" if width == TILE else f".p/{width}"))
-        except TooLarge as ex:
-            # Tiles are immutable, so an oversized one stays oversized: skip it.
+        except (TooLarge, BadEncoding) as ex:
+            # Tiles are immutable, so an oversized or undecodable one stays so: skip it.
             self.conn.close(); self.bad += 1
             sys.stderr.write(f"  [{self.name}] data tile {n}: {ex}; skipped\n")
             return [], width - skip
@@ -383,14 +391,28 @@ def verified_on_disk(path, verify=verify_loglist):
         return verify(body, sig)
     except (OSError, ValueError): return False
 
-def refresh_loglist(path, fetch, verify=verify_loglist):
-    # Replace the log list only with one that is signed by Chrome's key and
-    # parses; keep the old one otherwise. The signature is kept beside it.
+def _stamp(data):
+    return _iso(data["log_list_timestamp"]) if "log_list_timestamp" in data else None
+
+def _older(data, path, verify):
+    # True when the stored, verified list is newer (a replayed old signed list).
+    if not verified_on_disk(path, verify): return False
+    try:
+        with open(path) as f: old = _stamp(json.load(f))
+        new = _stamp(data)
+    except (OSError, ValueError, KeyError): return False
+    return old is not None and (new is None or new < old)
+
+def refresh_loglist(path, fetch, verify=verify_loglist, accept=None):
+    # Replace the log list only with one that is signed by Chrome's key, parses,
+    # is not older than the stored one and passes `accept`; else keep the old one.
     try:
         body, sig = fetch()
         if not verify(body, sig): raise ValueError("bad signature")
         data = json.loads(body)
         if not isinstance(data.get("operators"), list): raise ValueError("no operators")
+        if _older(data, path, verify): raise ValueError("older than the stored list")
+        if accept and not accept(data): raise ValueError("selects no logs")
     except Exception as ex:
         sys.stderr.write(f"[tail] log list refresh failed, keeping {path}: {ex}\n"); return False
     for dst, blob in ((path + ".sig", sig), (path, body)):
@@ -445,7 +467,9 @@ def boot(path, fetch, now, verify=verify_loglist):
     # Start only from a list whose stored signature verifies; refetch otherwise.
     if not verified_on_disk(path, verify) and not refresh_loglist(path, fetch, verify):
         raise SystemExit(f"[tail] no verified log list at {path}; exiting for a restart")
-    return select(path, now)
+    logs = select(path, now)
+    if not logs: raise SystemExit(f"[tail] {path} selects no current logs; exiting for a restart")
+    return logs
 
 def start(logs, running):
     for lg in logs:
@@ -455,7 +479,7 @@ def start(logs, running):
 
 def refresh_cycle(running, path, fetch, now, launch, verify=verify_loglist):
     # New shards start, expired/retired ones stop; a bad list changes nothing.
-    if not refresh_loglist(path, fetch, verify): return
+    if not refresh_loglist(path, fetch, verify, lambda d: bool(pick_logs(d, now))): return
     new, gone = reconcile(running, select(path, now))
     for url in gone: running.pop(url).set()
     if new or gone:

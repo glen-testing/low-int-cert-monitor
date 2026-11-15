@@ -141,8 +141,26 @@ class DecodeBody(unittest.TestCase):
             t.decode_body(two, "gzip", 3)
 
     def test_truncated_gzip_is_an_error(self):
-        with self.assertRaises(EOFError):
+        with self.assertRaises(t.BadEncoding):
             t.decode_body(gzip.compress(b"tile" * 100)[:-12], "gzip", 1000)
+
+
+class DecodeBodyEdges(unittest.TestCase):
+    def test_trailing_zero_padding_is_ignored_like_gzip_decompress(self):
+        body = gzip.compress(b"hello") + b"\0" * 8
+        self.assertEqual(t.decode_body(body, "gzip", 100), gzip.decompress(body))
+
+    def test_corrupt_gzip_is_a_bad_encoding(self):
+        with self.assertRaises(t.BadEncoding):
+            t.decode_body(b"\x1f\x8b\x08\x00garbage-garbage", "gzip", 100)
+        with self.assertRaises(t.BadEncoding):
+            t.decode_body(gzip.compress(b"hello") + b"junk", "gzip", 100)
+
+    def test_member_count_is_limited(self):
+        one = gzip.compress(b"A")
+        self.assertEqual(t.decode_body(one * t.MAX_GZIP_MEMBERS, "gzip", 10 ** 6), b"A" * t.MAX_GZIP_MEMBERS)
+        with self.assertRaises(t.BadEncoding):
+            t.decode_body(one * (t.MAX_GZIP_MEMBERS + 1), "gzip", 10 ** 6)
 
 
 class FakeResponse:
@@ -189,6 +207,12 @@ class ConnLimits(unittest.TestCase):
         before = t.reqs[0]
         self.assertEqual(self.conn(FakeResponse(b"x" * 10)).raw("tile/data/000", limit=10), b"x" * 10)
         self.assertEqual(t.reqs[0], before + 1)
+
+    def test_undecodable_tile_is_skipped_not_retried(self):
+        src = t.StaticCT(self.conn(FakeResponse(b"\x1f\x8b\x08\x00broken", encoding="gzip")), t.IssuerCache(), clock=Clock())
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(src.fetch(0, 512), ([], 256))
+        self.assertEqual(src.bad, 1)
 
     def test_get_uses_the_json_limit(self):
         body = json.dumps({"tree_size": 1, "pad": "x" * 2_000_000}).encode()
@@ -460,6 +484,17 @@ class RefreshCycle(unittest.TestCase):
             self.assertEqual([lg.name for lg in launched], ["A rfc", "A tiles", "B tiles"])
             self.assertEqual(read_json(path), loglist(now))
 
+    def test_list_selecting_no_logs_stops_nothing(self):
+        now = datetime.datetime.now(datetime.timezone.utc)
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "loglist.json")
+            ev = threading.Event()
+            running = {"https://a/rfc/": ev}
+            with contextlib.redirect_stderr(io.StringIO()):
+                t.refresh_cycle(running, path, lambda: (b'{"operators": []}', b"s"), now, lambda *a: self.fail("launched"), OK)
+            self.assertEqual(running, {"https://a/rfc/": ev})
+            self.assertFalse(ev.is_set() or os.path.exists(path))
+
     def test_failed_fetch_changes_nothing(self):
         now = datetime.datetime.now(datetime.timezone.utc)
         with tempfile.TemporaryDirectory() as d:
@@ -495,6 +530,12 @@ class Boot(unittest.TestCase):
             self.assertTrue(t.boot(path, lambda: (good, b"good"), now, verify))
             self.assertEqual(read_json(path), loglist(now))
 
+    def test_list_selecting_no_logs_exits(self):
+        now = datetime.datetime.now(datetime.timezone.utc)
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(SystemExit):
+                t.boot(os.path.join(d, "l.json"), lambda: (b'{"operators": []}', b"s"), now, OK)
+
     def test_no_verified_list_at_all_exits(self):
         now = datetime.datetime.now(datetime.timezone.utc)
         with tempfile.TemporaryDirectory() as d:
@@ -523,6 +564,27 @@ class RefreshLoglist(unittest.TestCase):
                 self.assertFalse(t.refresh_loglist(path, lambda: (b"<html>oops", b"s"), OK))
                 self.assertFalse(t.refresh_loglist(path, lambda: (b'{"no": "operators"}', b"s"), OK))
             self.assertEqual(read_json(path), {"operators": []})
+
+    def test_older_signed_list_is_rejected_newer_and_equal_accepted(self):
+        lst = lambda ts: json.dumps({"log_list_timestamp": ts, "operators": []}).encode()
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "loglist.json")
+            self.assertTrue(t.refresh_loglist(path, lambda: (lst("2026-11-14T13:36:22Z"), b"s"), OK))
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertFalse(t.refresh_loglist(path, lambda: (lst("2026-10-01T00:00:00Z"), b"s"), OK))
+                self.assertFalse(t.refresh_loglist(path, lambda: (b'{"operators": []}', b"s"), OK))
+            self.assertIn("older than the stored list", err.getvalue())
+            self.assertEqual(read_json(path)["log_list_timestamp"], "2026-11-14T13:36:22Z")
+            self.assertTrue(t.refresh_loglist(path, lambda: (lst("2026-11-14T13:36:22Z"), b"s"), OK))
+            self.assertTrue(t.refresh_loglist(path, lambda: (lst("2026-11-15T00:00:00Z"), b"s"), OK))
+
+    def test_stored_list_without_a_valid_sig_does_not_block_an_update(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "loglist.json")
+            with open(path, "w") as f:
+                json.dump({"log_list_timestamp": "2030-01-01T00:00:00Z", "operators": []}, f)
+            body = json.dumps({"log_list_timestamp": "2026-11-14T00:00:00Z", "operators": []}).encode()
+            self.assertTrue(t.refresh_loglist(path, lambda: (body, b"s"), lambda b, s: s == b"s"))
 
     def test_badly_signed_list_is_rejected_and_old_one_kept(self):
         with tempfile.TemporaryDirectory() as d:
