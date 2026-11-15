@@ -13,8 +13,8 @@ Curves: P-256, P-384, P-521.
 ## Performance (single core, ~24h steady state)
 | metric | value |
 |---|---|
-| certificates seen (all logs) | 2,622/s (~227M/day) |
-| distinct after cross-log dedup | 423/s (~36.5M/day), 84% dedup |
+| certificates seen | 2,622/s |
+| distinct after cross-log dedup | 423/s (84% dedup) |
 | weak keys found | 0 |
 | CPU | ~5% of one core (I capped mine @1core) |
 | RAM | ~580 MB (peak 642 MB, 1 GB cap) |
@@ -22,8 +22,6 @@ Curves: P-256, P-384, P-521.
 | disk I/O | ~none (table loads once from page cache; findings are written only for hits) |
 
 Scales with CT issuance volume. Measured on AWS m7g.large (aarch64), 16 CT logs ingested.
-Rates are averages over 8.7 h (2026-11-15, 05:19 to 14:03 UTC) of the tailer
-reading tiled and RFC 6962 logs, from the `p4mon stream` stats in the journal.
 
 ## p4mon
     cargo build --release --manifest-path p4mon/Cargo.toml
